@@ -21,7 +21,7 @@ static const luaL_reg mylib[] = {
     {NULL,NULL}
 };
 
-int luaopen_cool(lua_State *L)
+int luaopen_sharedtensor(lua_State *L)
 {
     luaL_register (L, "sharedtensor", mylib);
     return 1;
