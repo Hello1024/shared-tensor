@@ -22,3 +22,28 @@ A distributed, shared tensor with high performance approximate updates for machi
 The transfer uses compression which assumes latency for approximate updates is most important.  It also assumes the magnitude of all values is similar.  The synchronisation is fully ascynchronous, and while it will always eventually converge over time, values may overshoot temporaraly.
 
 All machines must be able to connect to one another.  They will form a tree formation internally.  Nodes will pass around other nodes IP addresses, so all must be on an IPv4 network with no NAT or port mappings etc.  Multiple tensors must use different ports.  
+
+
+## TODO:
+
+* Sync CPU throttling when very few updates are being made.   Currently, sync will continue forever even if changes are very slow or intermittant, potentially consuming lots of CPU, especially on fast networks.
+
+* Nicer handling of disconnections and errors in general.  Reconnection logic would be cool.
+
+* Tree "design" to allow for variable latency links or network topologies where some systems can't see others.
+
+* More complete examples, including `char-rnn`
+
+* Diagrams in documentation.
+
+* Support "table sync" so that a table of tensors all get synched, but tensors can have different magnitudes
+
+* Try different compression methods in the real world
+
+* build AWS image/integration.
+
+* Do the actual delta compression in a cuda kernel.  Should save *lots* of CPU.
+
+## Want to help out?
+
+Pull requests accepted!
