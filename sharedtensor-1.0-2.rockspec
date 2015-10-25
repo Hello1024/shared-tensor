@@ -1,8 +1,8 @@
 package = "sharedtensor"
- version = "1.0-1"
+ version = "1.0-2"
  source = {
     url = "git://github.com/Hello1024/shared-tensor",
-    tag = "v1.0",
+    tag = "v1.2",
  }
  description = {
     summary = "A distributed, shared tensor with high performance approximate updates for machine learning.",
