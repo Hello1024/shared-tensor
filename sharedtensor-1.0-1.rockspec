@@ -14,13 +14,13 @@ package = "sharedtensor"
  }
  dependencies = {
     "lua >= 5.1",
+    "torch >= 7.0",
  }
  build = {
     type = "builtin",
     modules = {
        sharedtensor = {
           sources = {"src/sharedtensor.c"},
-          defines = {"MAX_DATES_PER_MEAL=50"},
           libraries = {"m"},
        }
     },

@@ -23,7 +23,7 @@
 
 typedef struct {
   int fd;
-  
+  int closing;   // set to 1 during shutdown.
   float* delta;   // remaining delta to be sent down this connection
 } Connection;
 
@@ -55,10 +55,10 @@ void * sync_in(void* void_sp) {
   int valueslen = sp->s->valueslen;
   int buflen = (valueslen+7)/8;
   char buf[buflen];
-  while (1) {
+  while (!sp->c->closing) {
     float scale;
-    if (read(sp->c->fd, &scale, sizeof(float)) != sizeof(float)) fprintf(stderr, "Short Read\n");
-    if (read(sp->c->fd, buf, buflen) != buflen) { fprintf(stderr, "Short Read\n"); return;}
+    if (read(sp->c->fd, &scale, sizeof(float)) != sizeof(float)) { fprintf(stderr, "Short Read\n"); sp->c->closing=1; return; }
+    if (read(sp->c->fd, buf, buflen) != buflen) { fprintf(stderr, "Short Read\n"); sp->c->closing=1; return;}
         
     if (&sp->s->left != sp->c) save_deltas(buf, sp->s->left.delta, valueslen, scale); 
     if (&sp->s->right != sp->c) save_deltas(buf, sp->s->right.delta, valueslen, scale);
@@ -81,7 +81,7 @@ void * synca(void* void_sp) {
   float* values = sp->c->delta;
   int buflen = (valueslen+7)/8;
   char buf[buflen];
-  while (1) {
+  while (!sp->c->closing) {
     // figure out RMS magnitude
     // It's unclear the perfect scale number here
     // A smaller number would be good for getting
@@ -94,10 +94,13 @@ void * synca(void* void_sp) {
 
     for (i=0; i<valueslen; i++)
       scale += sp->c->delta[i] * sp->c->delta[i];
-    scale = sqrt(scale) / valueslen;
-        
-    // TODO:  round scale to power of 2
-    // TODO:  halt if scale == 0
+    scale = sqrt(scale / valueslen);
+    scale = pow(2,floor(log2(scale)));
+    
+    // TODO:  halt and reawaken later if scale == 0
+    if (scale==0) {
+      sleep(1);
+    }
     
     bzero(buf, buflen);
     for (i=0; i<valueslen; i++) {
@@ -110,14 +113,15 @@ void * synca(void* void_sp) {
     }
     
     if (write(sp->c->fd, &scale, sizeof(float)) != sizeof(float)) fprintf(stderr, "Short Write\n");;
-    if (write(sp->c->fd, buf, buflen) != buflen) { fprintf(stderr, "Short Write\n"); break; }
+    if (write(sp->c->fd, buf, buflen) != buflen) { fprintf(stderr, "Short Write\n"); sp->c->closing=1; }
     
-    sleep(1);  // debug slowdown
   }
   
   if(pthread_join(in_thread, NULL)) {
     fprintf(stderr, "Error joining thread\n");
   }
+  
+  close(sp->c->fd);
   free((void*)sp);
 }
 
@@ -303,6 +307,8 @@ static int l_gc (lua_State *L) {
   SharedTensor *me = (SharedTensor *)lua_touserdata(L, 1);
   
   // close all the sockets to cause all threads to stop and die
+  // TODO:  This isn't technically valid - someone else could
+  // reuse the same fd number before the thread dies.
   close(me->up.fd);
   close(me->left.fd);
   close(me->right.fd);
