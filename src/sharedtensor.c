@@ -42,6 +42,41 @@ typedef struct {  // Used to pack params for thread creation.
   Connection* c;
 } SyncParams;
 
+void read_or_die(int fd, char *buf, size_t count) {
+  int res = 0;
+  while(count) {
+    res = read(fd, (char*)buf, count);
+    if (res == -1)
+      if (errno == EINTR)
+        continue;
+      else {
+        perror("read from socket");
+        exit(-1);
+      }
+        
+    count -= res;
+    buf += res;
+  }
+}
+
+void write_or_die(int fd, char *buf, size_t count) {
+  int res = 0;
+  while(count) {
+    res = write(fd, (char*)buf, count);
+    if (res == -1)
+      if (errno == EINTR)
+        continue;
+      else {
+        perror("write to socket");
+        exit(-1);
+      }
+        
+    count -= res;
+    buf += res;
+  }
+}
+
+
 void save_deltas(unsigned char* data, float* values, int valueslen, float scale) {
   int i;
   for (i=0; i<valueslen; i++) {
@@ -57,8 +92,8 @@ void * sync_in(void* void_sp) {
   char buf[buflen];
   while (!sp->c->closing) {
     float scale;
-    if (read(sp->c->fd, &scale, sizeof(float)) != sizeof(float)) { fprintf(stderr, "Short Read\n"); sp->c->closing=1; return; }
-    if (read(sp->c->fd, buf, buflen) != buflen) { fprintf(stderr, "Short Read\n"); sp->c->closing=1; return;}
+    read_or_die(sp->c->fd, (char*)&scale, sizeof(float));
+    read_or_die(sp->c->fd, buf, buflen);
         
     if (&sp->s->left != sp->c) save_deltas(buf, sp->s->left.delta, valueslen, scale); 
     if (&sp->s->right != sp->c) save_deltas(buf, sp->s->right.delta, valueslen, scale);
@@ -112,8 +147,8 @@ void * synca(void* void_sp) {
       }
     }
     
-    if (write(sp->c->fd, &scale, sizeof(float)) != sizeof(float)) fprintf(stderr, "Short Write\n");;
-    if (write(sp->c->fd, buf, buflen) != buflen) { fprintf(stderr, "Short Write\n"); sp->c->closing=1; }
+    write_or_die(sp->c->fd, (char*)&scale, sizeof(float));
+    write_or_die(sp->c->fd, buf, buflen);
     
   }
   
@@ -136,7 +171,7 @@ void * do_listening(void* void_s) {
    
    // connect this guy to left side
    s->left.fd = accept(s->listen_fd, (struct sockaddr*)&left_addr, &unused_addrlen);
-   if (write(s->left.fd,"Y",1)!=1) fprintf(stderr, "Conn died\n");
+   write_or_die(s->left.fd,"Y",1);
    pthread_t left_thread=0;
    p_sp = (SyncParams*)malloc(sizeof(SyncParams));
    p_sp->s = s;
@@ -147,7 +182,7 @@ void * do_listening(void* void_s) {
    
    // connect this guy to right side
    s->right.fd = accept(s->listen_fd, (struct sockaddr*)&right_addr, &unused_addrlen);
-   if (write(s->right.fd,"Y",1)!=1) fprintf(stderr, "Conn died\n");
+   write_or_die(s->right.fd,"Y",1);
    pthread_t right_thread=0;
    p_sp = (SyncParams*)malloc(sizeof(SyncParams));
    p_sp->s = s;
@@ -161,9 +196,9 @@ void * do_listening(void* void_s) {
    while(1) {
      int newfd = accept(s->listen_fd, (struct sockaddr*)&unused_addr, &unused_addrlen);
      if (newfd<0) break;
-     if(write(newfd,"N",1)!=1) fprintf(stderr, "Conn died\n");
+     write_or_die(newfd,"N",1);
      struct sockaddr_in* addr_to_give = lrcounter++&1?&left_addr:&right_addr;
-     if(write(newfd,(char*)addr_to_give,sizeof(left_addr))!=sizeof(left_addr)) fprintf(stderr, "Conn died\n");
+     write_or_die(newfd,(char*)addr_to_give,sizeof(left_addr));
      
      close(newfd);
    }
@@ -203,7 +238,8 @@ int connect_to(SharedTensor* s, const char* host, const int port) {
      
      /* Now connect to the server */
      if (connect(s->up.fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-       fprintf(stderr, "Becoming master.\n");
+       // this case indicates we failed to connect.
+       // We don't report the error, because we might be master.
        close(s->up.fd);
        s->up.fd = -1;
        break;
@@ -211,7 +247,7 @@ int connect_to(SharedTensor* s, const char* host, const int port) {
 
      // successfully connected, but do we need to move?
      char buf;
-     if (read(s->up.fd,&buf,1)!=1) fprintf(stderr, "Conn died\n");
+     read_or_die(s->up.fd,&buf,1);
      
      if (buf=='Y') {
        pthread_t up_thread;
@@ -238,13 +274,21 @@ int connect_to(SharedTensor* s, const char* host, const int port) {
    if (s->listen_fd < 0) { perror("socket");}
 	 
    if (setsockopt(s->listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
-       perror("setsockopt");
+     perror("setsockopt");
+     return -1;
    }
 	 if (bind(s->listen_fd, (struct sockaddr*)&serv_addr, serv_addrlen)) {
 	   perror("bind");
-     fprintf(stderr, "Likley you specified an address to connect to which is neither on this machine nor running a copy of sharedtensor.\n"); 
+	   
+     fprintf(stderr, "Likley you specified an address to connect to which is neither on this machine nor running a copy of sharedtensor.  Alternatively, there is a network issue with one of the clients already connected and we can't contact them.\n"); 
+     return -1;
    }
 	 
+	 if (s->up.fd == -1) {
+	   fprintf(stderr, "Master Tensor.  Connect more machines to %s:%d for faster learning.\n", host, port);
+   } else {
+	   fprintf(stderr, "Successfully connected to %s:%d (and other clients).\n", host, port);     
+   }
    listen(s->listen_fd, 5);
    
    // create new thread to accept new connections
@@ -305,6 +349,10 @@ static int l_createOrFetch (lua_State *L) {
 // defining functions callable from Lua
 static int l_gc (lua_State *L) {
   SharedTensor *me = (SharedTensor *)lua_touserdata(L, 1);
+  
+  // TODO:  Fix this mess.  Currently, this object is un-gc-able.
+  fprintf(stderr, "You tried to destroy a sharedtensor.  Due to my foolish coding, there isn't support for this client to tell all the other clients connected to it that they need to reconnect to other nodes.  If I disconnect now, they'll get all out of sync.  Hence, everyone on this sharedtensor will crash now to avoid inconsistency.  Patches welcome :-)\n");
+  exit(-1);
   
   // close all the sockets to cause all threads to stop and die
   // TODO:  This isn't technically valid - someone else could
