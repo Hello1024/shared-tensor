@@ -21,18 +21,25 @@
 #include <TH/THTensor.h>
 #include <luaT.h>
 
+typedef struct SharedTensor;
+
 typedef struct {
+  SharedTensor* s;  // backlink to enclosing structure
   int fd;
-  int closing;   // set to 1 during shutdown.
+  int closing;    // set to 1 during shutdown.
+  int in_count;   // how many complete inward cycles
+  int out_count;  // how many complete outward cycles.
+  pthread_t in_thread;
+  pthread_t out_thread;
+  pthread_cond_t state_change;  // fired for all state changes
+  pthread_mutex_t mutex;    // protects all fields
+  
   float* delta;   // remaining delta to be sent down this connection
 } Connection;
 
 typedef struct {
-  Connection up;
-  Connection left;
-  Connection right;
+  Connection c[4];
   int valueslen;
-  float* values;
   int listen_fd;
   pthread_t listen_thread;
 } SharedTensor;
@@ -257,7 +264,8 @@ int connect_to(SharedTensor* s, const char* host, const int port) {
        if(pthread_create(&up_thread, NULL, synca, upsp)) {
          fprintf(stderr, "Error creating thread\n");
        }
-
+       
+       // 
        if (getsockname(s->up.fd, (struct sockaddr*)&serv_addr, &serv_addrlen)) {
          perror("ERROR finding own socket");
        };
