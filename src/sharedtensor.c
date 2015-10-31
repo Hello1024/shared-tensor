@@ -49,16 +49,16 @@ typedef struct {  // Used to pack params for thread creation.
   Connection* c;
 } SyncParams;
 
-void read_or_die(int fd, char *buf, size_t count) {
+void read_or_close(Connection* c, char *buf, size_t count) {
   int res = 0;
-  while(count) {
-    res = read(fd, (char*)buf, count);
+  while(count && !c->closing) {
+    res = read(c->`fd, (char*)buf, count);
     if (res == -1)
       if (errno == EINTR)
         continue;
       else {
+        c->closing = 1;
         perror("read from socket");
-        exit(-1);
       }
         
     count -= res;
@@ -66,16 +66,16 @@ void read_or_die(int fd, char *buf, size_t count) {
   }
 }
 
-void write_or_die(int fd, char *buf, size_t count) {
+void write_or_close(Connection* c, char *buf, size_t count) {
   int res = 0;
-  while(count) {
-    res = write(fd, (char*)buf, count);
+  while(count && !c->closing) {
+    res = write(c->fd, (char*)buf, count);
     if (res == -1)
       if (errno == EINTR)
         continue;
       else {
         perror("write to socket");
-        exit(-1);
+        c->closing = 1;
       }
         
     count -= res;
@@ -92,38 +92,34 @@ void save_deltas(unsigned char* data, float* values, int valueslen, float scale)
 }
 
 void * sync_in(void* void_sp) {
-  SyncParams* sp = (SyncParams*)void_sp;
+  Connection* c = (Connection*)void_c;
   
-  int valueslen = sp->s->valueslen;
+  int valueslen = c->s->valueslen;
   int buflen = (valueslen+7)/8;
   char buf[buflen];
-  while (!sp->c->closing) {
+  while (!c->closing) {
     float scale;
-    read_or_die(sp->c->fd, (char*)&scale, sizeof(float));
-    read_or_die(sp->c->fd, buf, buflen);
+    read_or_close(c, (char*)&scale, sizeof(float));
+    read_or_close(c, buf, buflen);
+    if (c->closing) break;
         
-    if (&sp->s->left != sp->c) save_deltas(buf, sp->s->left.delta, valueslen, scale); 
-    if (&sp->s->right != sp->c) save_deltas(buf, sp->s->right.delta, valueslen, scale);
-    if (&sp->s->up != sp->c) save_deltas(buf, sp->s->up.delta, valueslen, scale);
-    save_deltas(buf, sp->s->values, valueslen, scale);
+    if (&c->s->left != c) save_deltas(buf, c->s->left.delta, valueslen, scale); 
+    if (&c->s->right != c) save_deltas(buf, c->s->right.delta, valueslen, scale);
+    if (&c->s->up != c) save_deltas(buf, c->s->up.delta, valueslen, scale);
+    save_deltas(buf, c->s->values, valueslen, scale);
     
   }
 
 }
 
-void * synca(void* void_sp) {
-  SyncParams* sp = (SyncParams*)void_sp;
+void * sync_out(void* void_c) {
+  Connection* c = (Connection*)void_c;
   
-  pthread_t in_thread;
-  if(pthread_create(&in_thread, NULL, sync_in, void_sp)) {
-    fprintf(stderr, "Error creating thread\n");
-  }
-
-  int valueslen = sp->s->valueslen;
-  float* values = sp->c->delta;
+  int valueslen = c->s->valueslen;
+  float* values = c->delta;
   int buflen = (valueslen+7)/8;
   char buf[buflen];
-  while (!sp->c->closing) {
+  while (!c->closing) {
     // figure out RMS magnitude
     // It's unclear the perfect scale number here
     // A smaller number would be good for getting
@@ -135,7 +131,7 @@ void * synca(void* void_sp) {
     float scale = 0;
 
     for (i=0; i<valueslen; i++)
-      scale += sp->c->delta[i] * sp->c->delta[i];
+      scale += c->delta[i] * c->delta[i];
     scale = sqrt(scale / valueslen);
     scale = pow(2,floor(log2(scale)));
     
@@ -154,8 +150,8 @@ void * synca(void* void_sp) {
       }
     }
     
-    write_or_die(sp->c->fd, (char*)&scale, sizeof(float));
-    write_or_die(sp->c->fd, buf, buflen);
+    write_or_die(c->fd, (char*)&scale, sizeof(float));
+    write_or_die(c->fd, buf, buflen);
     
   }
   
@@ -163,9 +159,41 @@ void * synca(void* void_sp) {
     fprintf(stderr, "Error joining thread\n");
   }
   
-  close(sp->c->fd);
+  close(c->fd);
   free((void*)sp);
 }
+
+
+void set_up_connection(Connection* c, SharedTensor* s, int fd) {
+  pthread_cond_init(&c->state_change, NULL);
+  pthread_mutex_init(&c->mutex, NULL);
+  pthread_mutex_lock(&c->mutex);
+  c->s = s;
+  c->fd = fd;
+  c->closing = 0;
+  c->in_count = 0;
+  c->out_count = 0;
+  c->in_thread = NULL;
+  c->out_thread = NULL;
+  c->delta = (float*)malloc(c->s->valueslen * sizeof(float));
+  pthread_create(&c->in_thread, NULL, sync_in, c)) {
+  pthread_create(&c->out_thread, NULL, sync_out, c)) {
+  pthread_mutex_unlock(&c->mutex);
+}
+
+void tear_down_connection(Connection* c) {
+  pthread_mutex_lock(&c->mutex);
+  c->closing = 1;  
+  pthread_mutex_unlock(&c->mutex);
+  
+  pthread_join(c->in_thread, NULL);
+  pthread_join(c->out_thread, NULL);
+  
+  free(c->delta);
+  close(c->fd);
+  pthread_mutex_destroy(&c->mutex);
+}
+
 
 
 void * do_listening(void* void_s) {
@@ -181,8 +209,8 @@ void * do_listening(void* void_s) {
    write_or_die(s->left.fd,"Y",1);
    pthread_t left_thread=0;
    p_sp = (SyncParams*)malloc(sizeof(SyncParams));
-   p_sp->s = s;
-   p_sp->c = &s->left;
+   p_c->s = s;
+   p_c = &s->left;
    if(pthread_create(&left_thread, NULL, synca, p_sp)) {
      fprintf(stderr, "Error creating thread\n");
    }
@@ -192,8 +220,8 @@ void * do_listening(void* void_s) {
    write_or_die(s->right.fd,"Y",1);
    pthread_t right_thread=0;
    p_sp = (SyncParams*)malloc(sizeof(SyncParams));
-   p_sp->s = s;
-   p_sp->c = &s->right;
+   p_c->s = s;
+   p_c = &s->right;
    if(pthread_create(&right_thread, NULL, synca, p_sp)) {
      fprintf(stderr, "Error creating thread\n");
    }
@@ -259,8 +287,8 @@ int connect_to(SharedTensor* s, const char* host, const int port) {
      if (buf=='Y') {
        pthread_t up_thread;
        SyncParams* upsp = (SyncParams*)malloc(sizeof(SyncParams));
-       upsp->s = s;
-       upsp->c = &s->up;
+       upc->s = s;
+       upc = &s->up;
        if(pthread_create(&up_thread, NULL, synca, upsp)) {
          fprintf(stderr, "Error creating thread\n");
        }
