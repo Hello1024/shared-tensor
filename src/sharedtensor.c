@@ -370,7 +370,11 @@ static int l_createOrFetch (lua_State *L) {
   me->values = malloc(me->valueslen*sizeof(float));
   
   // Try to connect to given host/port
-  connect_to(me, host, port);
+  if (connect_to(me, host, port)<0) {
+    fprintf(stderr, "Connection error, exiting!\n");
+    exit(1);
+  }
+  
   
   if (me->up.fd<0) {
     // we have no parent, so should add in the provided tensor.
