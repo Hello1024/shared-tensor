@@ -3,17 +3,19 @@ A distributed, shared tensor with high performance approximate updates for machi
 
 ## Example use:
 
+    require 'sharedtensor'
+    
     original_tensor = torch.Tensor(4,5,6,2)
 
     -- Tries to connect to a shared tensor.  If the connection
     -- succeeds, use that, else start a new shared tensor with
     -- values from "original_tensor".
-    z = sharedTensor.createOrFetch(original_tensor, "192.168.0.1:9925")
+    z = sharedtensor.createOrFetch("192.168.0.1", 9925, original_tensor)
 
     while true do
       z:copyToTensor(current_values)
       new_values = ...  -- do learning on this...
-      z.addFromTensor(new_values.csub(curent_values));
+      z:addFromTensor(new_values.csub(curent_values));
     end
 
 
@@ -26,7 +28,7 @@ All machines must be able to connect to one another.  They will form a tree form
 
 ## TODO:
 
-* Sync CPU throttling when very few updates are being made.   Currently, sync will continue forever even if changes are very slow or intermittant, potentially consuming lots of CPU, especially on fast networks.
+* Way to limit network bandwidth based on fixed bitrate or fixed quality setting.  Currently simply fills all bandwidth.
 
 * Nicer handling of disconnections and errors in general.  Reconnection logic would be cool.
 

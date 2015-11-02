@@ -17,7 +17,7 @@
 
 // threading
 #include <pthread.h>
-
+#include <signal.h>
 #include <TH/THTensor.h>
 #include <luaT.h>
 
@@ -35,6 +35,7 @@ typedef struct {
   float* values;
   int listen_fd;
   pthread_t listen_thread;
+  int closing;
 } SharedTensor;
 
 typedef struct {  // Used to pack params for thread creation.
@@ -42,40 +43,65 @@ typedef struct {  // Used to pack params for thread creation.
   Connection* c;
 } SyncParams;
 
-void read_or_die(int fd, char *buf, size_t count) {
+// noop handler to force accept and read() to return;
+void sighand(int signo)
+{
+  return;
+}
+
+
+void read_or_die(int fd, unsigned char *buf, size_t count) {
   int res = 0;
   while(count) {
-    res = read(fd, (char*)buf, count);
-    if (res == -1)
+    res = read(fd, buf, count);
+    if (res == -1) {
       if (errno == EINTR)
         continue;
       else {
         perror("read from socket");
         exit(-1);
       }
+    }
         
     count -= res;
     buf += res;
   }
 }
 
-void write_or_die(int fd, char *buf, size_t count) {
+void write_or_die(int fd, unsigned char *buf, size_t count) {
   int res = 0;
   while(count) {
-    res = write(fd, (char*)buf, count);
-    if (res == -1)
+    res = write(fd, buf, count);
+    if (res == -1) {
       if (errno == EINTR)
         continue;
       else {
         perror("write to socket");
         exit(-1);
       }
+    }
         
     count -= res;
     buf += res;
   }
 }
 
+int accept_or_die(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int* closing) {
+  int res=-1;
+  while(res<0) {
+    res = accept(sockfd, addr, addrlen);
+    if (*closing) return -1;
+    if (res == -1) {
+      if (errno == EINTR) {
+        continue; 
+      } else {
+        perror("accept");
+        exit(-1);
+      }
+    }
+  }
+  return res;
+}
 
 void save_deltas(unsigned char* data, float* values, int valueslen, float scale) {
   int i;
@@ -89,10 +115,10 @@ void * sync_in(void* void_sp) {
   
   int valueslen = sp->s->valueslen;
   int buflen = (valueslen+7)/8;
-  char buf[buflen];
+  unsigned char buf[buflen];
   while (!sp->c->closing) {
     float scale;
-    read_or_die(sp->c->fd, (char*)&scale, sizeof(float));
+    read_or_die(sp->c->fd, (unsigned char*)&scale, sizeof(float));
     read_or_die(sp->c->fd, buf, buflen);
         
     if (&sp->s->left != sp->c) save_deltas(buf, sp->s->left.delta, valueslen, scale); 
@@ -101,7 +127,7 @@ void * sync_in(void* void_sp) {
     save_deltas(buf, sp->s->values, valueslen, scale);
     
   }
-
+  return NULL;
 }
 
 void * synca(void* void_sp) {
@@ -115,7 +141,7 @@ void * synca(void* void_sp) {
   int valueslen = sp->s->valueslen;
   float* values = sp->c->delta;
   int buflen = (valueslen+7)/8;
-  char buf[buflen];
+  unsigned char buf[buflen];
   while (!sp->c->closing) {
     // figure out RMS magnitude
     // It's unclear the perfect scale number here
@@ -147,7 +173,7 @@ void * synca(void* void_sp) {
       }
     }
     
-    write_or_die(sp->c->fd, (char*)&scale, sizeof(float));
+    write_or_die(sp->c->fd, (unsigned char*)&scale, sizeof(float));
     write_or_die(sp->c->fd, buf, buflen);
     
   }
@@ -158,6 +184,8 @@ void * synca(void* void_sp) {
   
   close(sp->c->fd);
   free((void*)sp);
+  
+  return NULL;
 }
 
 
@@ -170,8 +198,9 @@ void * do_listening(void* void_s) {
    
    
    // connect this guy to left side
-   s->left.fd = accept(s->listen_fd, (struct sockaddr*)&left_addr, &unused_addrlen);
-   write_or_die(s->left.fd,"Y",1);
+   s->left.fd = accept_or_die(s->listen_fd, (struct sockaddr*)&left_addr, &unused_addrlen, &s->closing);
+   if (s->closing) return NULL;
+   write_or_die(s->left.fd,(unsigned char*)"Y",1);
    pthread_t left_thread=0;
    p_sp = (SyncParams*)malloc(sizeof(SyncParams));
    p_sp->s = s;
@@ -181,8 +210,9 @@ void * do_listening(void* void_s) {
    }
    
    // connect this guy to right side
-   s->right.fd = accept(s->listen_fd, (struct sockaddr*)&right_addr, &unused_addrlen);
-   write_or_die(s->right.fd,"Y",1);
+   s->right.fd = accept_or_die(s->listen_fd, (struct sockaddr*)&right_addr, &unused_addrlen, &s->closing);
+   if (s->closing) return NULL;
+   write_or_die(s->right.fd,(unsigned char*)"Y",1);
    pthread_t right_thread=0;
    p_sp = (SyncParams*)malloc(sizeof(SyncParams));
    p_sp->s = s;
@@ -194,11 +224,11 @@ void * do_listening(void* void_s) {
    // reject all future connections with redirects to children.
    int lrcounter=0;
    while(1) {
-     int newfd = accept(s->listen_fd, (struct sockaddr*)&unused_addr, &unused_addrlen);
-     if (newfd<0) break;
-     write_or_die(newfd,"N",1);
+     int newfd = accept_or_die(s->listen_fd, (struct sockaddr*)&unused_addr, &unused_addrlen, &s->closing);
+     if (s->closing) break;
+     write_or_die(newfd,(unsigned char*)"N",1);
      struct sockaddr_in* addr_to_give = lrcounter++&1?&left_addr:&right_addr;
-     write_or_die(newfd,(char*)addr_to_give,sizeof(left_addr));
+     write_or_die(newfd,(unsigned char*)addr_to_give,sizeof(left_addr));
      
      close(newfd);
    }
@@ -208,6 +238,7 @@ void * do_listening(void* void_s) {
    if(pthread_join(right_thread, NULL)) {
      fprintf(stderr, "Error joining thread\n");
    }
+   return NULL;
 }
 
 int connect_to(SharedTensor* s, const char* host, const int port) {
@@ -220,9 +251,9 @@ int connect_to(SharedTensor* s, const char* host, const int port) {
    server = gethostbyname(host);
    if (server == NULL) { fprintf(stderr,"ERROR, no such host\n"); return -1; }
    
-   bzero((char *) &serv_addr, sizeof(serv_addr));
+   bzero((unsigned char *) &serv_addr, sizeof(serv_addr));
    serv_addr.sin_family = AF_INET;
-   bcopy((char *)server->h_addr, (char *)&serv_addr.sin_addr.s_addr, server->h_length);
+   bcopy((unsigned char *)server->h_addr, (unsigned char *)&serv_addr.sin_addr.s_addr, server->h_length);
    serv_addr.sin_port = htons(port);
    
    do {
@@ -246,7 +277,7 @@ int connect_to(SharedTensor* s, const char* host, const int port) {
      }
 
      // successfully connected, but do we need to move?
-     char buf;
+     unsigned char buf;
      read_or_die(s->up.fd,&buf,1);
      
      if (buf=='Y') {
@@ -265,7 +296,7 @@ int connect_to(SharedTensor* s, const char* host, const int port) {
      }
      
      // Weren't accepted, find who to connect to next lower down the tree
-     if (read(s->up.fd, &serv_addr, sizeof(serv_addr)) != sizeof(serv_addr)) fprintf(stderr, "Conn died\n");;
+     read_or_die(s->up.fd, (unsigned char*)&serv_addr, sizeof(serv_addr));
      close(s->up.fd);
    } while (1);
    
@@ -328,6 +359,10 @@ static int l_createOrFetch (lua_State *L) {
       
   bzero(me, sizeof(SharedTensor));
   
+  me->left.fd = -1;
+  me->right.fd = -1;
+  me->up.fd = -1;
+  
   me->valueslen = THFloatTensor_nElement(input);
   me->up.delta = malloc(me->valueslen*sizeof(float));
   me->left.delta = malloc(me->valueslen*sizeof(float));
@@ -340,6 +375,12 @@ static int l_createOrFetch (lua_State *L) {
   if (me->up.fd<0) {
     // we have no parent, so should add in the provided tensor.
     addFromInternal(me, input);
+  } else {
+    int i=0;    // Deliberately delay to get data delivered.
+    // TODO:  use events properly
+    while(!me->values[i++%me->valueslen]) {
+      if (!i) sleep(1);
+    }
   }
   
   return 1;
@@ -350,27 +391,40 @@ static int l_createOrFetch (lua_State *L) {
 static int l_gc (lua_State *L) {
   SharedTensor *me = (SharedTensor *)lua_touserdata(L, 1);
   
-  // TODO:  Fix this mess.  Currently, this object is un-gc-able.
-  fprintf(stderr, "You tried to destroy a sharedtensor.  Due to my foolish coding, there isn't support for this client to tell all the other clients connected to it that they need to reconnect to other nodes.  If I disconnect now, they'll get all out of sync.  Hence, everyone on this sharedtensor will crash now to avoid inconsistency.  Patches welcome :-)\n");
-  exit(-1);
-  
-  // close all the sockets to cause all threads to stop and die
-  // TODO:  This isn't technically valid - someone else could
-  // reuse the same fd number before the thread dies.
-  close(me->up.fd);
-  close(me->left.fd);
-  close(me->right.fd);
-  close(me->listen_fd);
+  if ( me->left.fd == -1 && me->right.fd == -1 && me->up.fd == -1) {
+    // nobody ever connected.
+    close(me->listen_fd);
     
-  // rejoin tree of threads
-  if(pthread_join(me->listen_thread, NULL)) {
-    fprintf(stderr, "Error joining thread\n");
+    me->closing = 1;
+    
+    struct sigaction actions;
+    memset(&actions, 0, sizeof(actions));
+    sigemptyset(&actions.sa_mask);
+    actions.sa_flags = 0;
+    actions.sa_handler = sighand;
+    sigaction(SIGALRM,&actions,NULL);
+    pthread_kill(me->listen_thread, SIGALRM);
+    
+    // rejoin tree of threads
+    if(pthread_join(me->listen_thread, NULL)) {
+       fprintf(stderr, "Error joining thread\n");
+    }
+    
+    free(me->up.delta);
+    free(me->left.delta);
+    free(me->right.delta);
+    free(me->values);
+  } else {
+    if ( me->up.fd != -1 ) {
+      // TODO:  Fix this mess.  Currently, this object is un-gc-able.
+      fprintf(stderr, "You tried to destroy a sharedtensor.  Due to my foolish coding, there isn't support for this client to tell all the other clients connected to it that they need to reconnect to other nodes.  If I disconnect now, they'll get all out of sync.  Hence, everyone on this sharedtensor will quit now to avoid inconsistency.  Patches welcome :-)\n");
+      exit(-1);     
+    } else {
+      fprintf(stderr, "You tried to destroy the master sharedtensor. All clients will be disconnected and will terminate.\n");
+      exit(-1);
+    }
   }
   
-  free(me->up.delta);
-  free(me->left.delta);
-  free(me->right.delta);
-  free(me->values);
   
   return 1;
 }
